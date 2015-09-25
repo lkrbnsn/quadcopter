@@ -1,9 +1,9 @@
 #include <Servo.h>
-#include <math.h>
-#include "Wire.h"
 #include "I2Cdev.h"
-#include "MPU9250.h"
-#include "BMP180.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+#include "Wire.h"
+#endif
 
 #define MAX_MOTOR 80
 #define MIN_MOTOR 50
@@ -26,62 +26,108 @@ Servo motor4;
 float v3 = 60;
 float v4 = 60;
 
-String incomingString;
+MPU6050 mpu;
+#define LED_PIN 13 // (Arduino is 13, Teensy is 11, Teensy++ is 6)
+bool blinkState = false;
 
-MPU9250 accelgyro;
-float Axyz[3];
-float Gxyz[3];
-float AvgAxyz[] = {0, 0, 0};
-float AvgGxyz[] = {0, 0, 0};
-float IniAxyz[] = {0, 0, 0};
-float IniGxyz[] = {0, 0, 0};
-int ax, ay, az;
-int gx, gy, gz;
-int mx, my, mz;
+// MPU control/status vars
+bool dmpReady = false;  // set true if DMP init was successful
+uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
+uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     // count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; // FIFO storage buffer
 
-int i = 0;
-float rollGyr = 0;
-float rollAcc = 0;
-float roll = 0;
+// orientation/motion vars
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorInt16 aa;         // [x, y, z]            accel sensor measurements
+VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
+VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
+VectorFloat gravity;    // [x, y, z]            gravity vector
+float euler[3];         // [psi, theta, phi]    Euler angle container
+float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
-void getAccelData(void)
+volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+void dmpDataReady()
 {
-  accelgyro.getMotion9(&ax, &ay, &az, &gx, &gy, &gz, &mx, &my, &mz);
-  Axyz[0] = (double) ax / 16384;
-  Axyz[1] = (double) ay / 16384;
-  Axyz[2] = (double) az / 16384;
-  Gxyz[0] = ((double) gx * 250 / 32768) + 1.45;
-  Gxyz[1] = ((double) gy * 250 / 32768) - 1.6;
-  Gxyz[2] = ((double) gz * 250 / 32768) - 6.75;
-
-  AvgAxyz[0] = (AvgAxyz[0] * 9 + Axyz[0]) / 10;
-  AvgAxyz[1] = (AvgAxyz[1] * 9 + Axyz[1]) / 10;
-  AvgAxyz[2] = (AvgAxyz[2] * 9 + Axyz[2]) / 10;
-  AvgGxyz[0] = (AvgGxyz[0] * 9 + Gxyz[0]) / 10;
-  AvgGxyz[1] = (AvgGxyz[1] * 9 + Gxyz[1]) / 10;
-  AvgGxyz[2] = (AvgGxyz[2] * 9 + Gxyz[2]) / 10;
+  mpuInterrupt = true;
 }
 
-void calculateVelocities()
+void setupMpu()
 {
-  rollGyr -= (AvgGxyz[0] - IniGxyz[0]) * 0.01;
-  rollAcc = asin(AvgAxyz[1] - IniAxyz[1]) * 57.2958;
-  roll = (rollGyr * 0.95 + rollAcc * 0.5);
-  
-  v3 = v3 - roll / 10;
-  v4 = v4 + roll / 10;
-  if (v3 > MAX_MOTOR) {
-    v3 = MAX_MOTOR;
+  // join I2C bus (I2Cdev library doesn't do this automatically)
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+  Wire.begin();
+  TWBR = 24; // 400kHz I2C clock (200kHz if CPU is 8MHz)
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+  Fastwire::setup(400, true);
+#endif
+
+  // initialize serial communication
+  // (115200 chosen because it is required for Teapot Demo output, but it's
+  // really up to you depending on your project)
+  Serial.begin(115200);
+  while (!Serial); // wait for Leonardo enumeration, others continue immediately
+
+  // NOTE: 8MHz or slower host processors, like the Teensy @ 3.3v or Ardunio
+  // Pro Mini running at 3.3v, cannot handle this baud rate reliably due to
+  // the baud timing being too misaligned with processor ticks. You must use
+  // 38400 or slower in these cases, or use some kind of external separate
+  // crystal solution for the UART timer.
+
+  // initialize device
+  Serial.println(F("Initializing I2C devices..."));
+  mpu.initialize();
+
+  // verify connection
+  Serial.println(F("Testing device connections..."));
+  Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
+
+  // wait for ready
+  Serial.println(F("\nSend any character to begin DMP programming and demo: "));
+  while (Serial.available() && Serial.read()); // empty buffer
+  while (!Serial.available());                 // wait for data
+  while (Serial.available() && Serial.read()); // empty buffer again
+
+  // load and configure the DMP
+  Serial.println(F("Initializing DMP..."));
+  devStatus = mpu.dmpInitialize();
+
+  // supply your own gyro offsets here, scaled for min sensitivity
+  mpu.setXGyroOffset(220);
+  mpu.setYGyroOffset(76);
+  mpu.setZGyroOffset(-85);
+  mpu.setZAccelOffset(1788); // 1688 factory default for my test chip
+
+  // make sure it worked (returns 0 if so)
+  if (devStatus == 0) {
+    // turn on the DMP, now that it's ready
+    Serial.println(F("Enabling DMP..."));
+    mpu.setDMPEnabled(true);
+
+    // enable Arduino interrupt detection
+    Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
+    attachInterrupt(0, dmpDataReady, RISING);
+    mpuIntStatus = mpu.getIntStatus();
+
+    // set our DMP Ready flag so the main loop() function knows it's okay to use it
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+    dmpReady = true;
+
+    // get expected DMP packet size for later comparison
+    packetSize = mpu.dmpGetFIFOPacketSize();
+  } else {
+    // ERROR!
+    // 1 = initial memory load failed
+    // 2 = DMP configuration updates failed
+    // (if it's going to break, usually the code will be 1)
+    Serial.print(F("DMP Initialization failed (code "));
+    Serial.print(devStatus);
+    Serial.println(F(")"));
   }
-  else if (v3 < MIN_MOTOR) {
-    v3 = MIN_MOTOR;
-  }
-  if (v4 > MAX_MOTOR) {
-    v4 = MAX_MOTOR;
-  }
-  else if (v4 < MIN_MOTOR) {
-    v4 = MIN_MOTOR;
-  }
+
+  // configure LED for output
+  pinMode(LED_PIN, OUTPUT);
 }
 
 void writeToMotors()
@@ -90,44 +136,19 @@ void writeToMotors()
   motor4.write(v4);
 }
 
+
+///////////////////////////////////////////////////
+
+
 void setup()
 {
-  Wire.begin();
-  accelgyro.initialize();
-
   //  motor1.attach(6);
   //  motor2.attach(7);
   motor3.attach(8);
   motor4.attach(9);
 
-  getAccelData();
-  IniAxyz[1] = Axyz[1];
-  IniAxyz[2] = Axyz[2];
-  IniAxyz[3] = Axyz[3];
+  setupMpu();
 
-  for (int i = 0; i < 12; i++)
-  {
-    IniGxyz[1] = ((IniGxyz[1]*9) + Gxyz[1]) / 10;
-    IniGxyz[2] = ((IniGxyz[2]*9) + Gxyz[2]) / 10;
-    IniGxyz[3] = ((IniGxyz[3]*9) + Gxyz[3]) / 10;
-  }
-
-  Serial.begin(9600);
-  Serial.println("Initializing");
-
-  //  motor1.write(30);
-  //  delay(3000);
-  //  Serial.println("Motor 1 armed");
-  //
-  //  motor2.write(30);
-  //  delay(3000);
-  //  Serial.println("Motor 2 armed");
-
-  //  motor3.write(30);
-  //  Serial.println("Motor 3 armed");
-  //
-  //  motor4.write(30);
-  //  Serial.println("Motor 4 armed");
 }
 
 
@@ -135,71 +156,61 @@ void setup()
 
 
 void loop() {
-  i++;
-  getAccelData();
-  delay(10);
+    // if programming failed, don't try to do anything
+    if (!dmpReady) return;
 
-  calculateVelocities();
-
-
-  if (i == 100)
-  {
-    Serial.print("IniGxyz[]: ");
-    Serial.print(IniGxyz[1]); Serial.print(" "); Serial.print(IniGxyz[2]); Serial.print(" "); Serial.println(IniGxyz[3]);
-    Serial.print("IniAxyz[1]: ");
-    Serial.println(IniAxyz[1]);
-    Serial.print("AvgGxyz[0]: ");
-    Serial.println(AvgGxyz[0]);
-    Serial.print("rollGyr: ");
-    Serial.println(rollGyr);
-    Serial.print("Axyz[1]: ");
-    Serial.println(Axyz[1]);
-    Serial.print("AvgAxyz[1]: ");
-    Serial.println(AvgAxyz[1]);
-    Serial.print("rollAcc: ");
-    Serial.println(rollAcc);
-    Serial.print("roll: ");
-    Serial.println(roll);
-    Serial.print("");
-    Serial.println(v3);
-    Serial.println(v4);
-    Serial.println();
-    i = 0;
-  }
-
-  if (Serial.available() > 0)
-  {
-    char ch = Serial.read();
-    if (ch != 10) {
-      Serial.print("I have received: ");
-      Serial.print(ch, DEC);
-      Serial.print('\n');
-      incomingString += ch;
+    // wait for MPU interrupt or extra packet(s) available
+    while (!mpuInterrupt && fifoCount < packetSize) {
+        // other program behavior stuff here
+        // .
+        // .
+        // .
+        // if you are really paranoid you can frequently test in between other
+        // stuff to see if mpuInterrupt is true, and if so, "break;" from the
+        // while() loop to immediately process the MPU data
+        // .
+        // .
+        // .
     }
-    else
-    {
-      // print the incoming string
-      Serial.println("I am printing the entire string");
-      Serial.println(incomingString);
 
-      // Convert the string to an integer
-      int val = incomingString.toInt();
+    // reset interrupt flag and get INT_STATUS byte
+    mpuInterrupt = false;
+    mpuIntStatus = mpu.getIntStatus();
 
-      // print the integer
-      Serial.println("Printing the value: ");
-      Serial.println(val);
-      if (val > -1 && val < 181)
-      {
-        Serial.println("Value is between 0 and 180");
-        motor3.write(val);
-        motor4.write(val);
-        delay(10000);
-      }
-      else
-      {
-        Serial.println("Value is NOT between 0 and 180");
-      }
-      incomingString = "";
+    // get current FIFO count
+    fifoCount = mpu.getFIFOCount();
+
+    // check for overflow (this should never happen unless our code is too inefficient)
+    if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+        // reset so we can continue cleanly
+        mpu.resetFIFO();
+        Serial.println(F("FIFO overflow!"));
+
+    // otherwise, check for DMP data ready interrupt (this should happen frequently)
+    } else if (mpuIntStatus & 0x02) {
+        // wait for correct available data length, should be a VERY short wait
+        while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+
+        // read a packet from FIFO
+        mpu.getFIFOBytes(fifoBuffer, packetSize);
+        
+        // track FIFO count here in case there is > 1 packet available
+        // (this lets us immediately read more without waiting for an interrupt)
+        fifoCount -= packetSize;
+
+            // display Euler angles in degrees
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+            Serial.print("ypr\t");
+            Serial.print(ypr[0] * 180/M_PI);
+            Serial.print("\t");
+            Serial.print(ypr[1] * 180/M_PI);
+            Serial.print("\t");
+            Serial.println(ypr[2] * 180/M_PI);
+
+        // blink LED to indicate activity
+        blinkState = !blinkState;
+        digitalWrite(LED_PIN, blinkState);
     }
-  }
 }
