@@ -54,13 +54,28 @@ void calculateVelocities()
 {
   pPID.Compute();
   rPID.Compute();
-  Serial.println(rOutput);
+  Serial.print("pPID: "); Serial.println(pOutput);
+  Serial.print("rPID: "); Serial.println(rOutput);
 
   v2 = 60 + throttle - pOutput - rOutput;
   v1 = 60 + throttle - pOutput + rOutput;
   v3 = 60 + throttle + pOutput - rOutput;
   v4 = 60 + throttle + pOutput + rOutput;
+  Serial.print("v2: "); Serial.println(v2);
+  Serial.print("v1: "); Serial.println(v1);
+  Serial.print("v3: "); Serial.println(v3);
+  Serial.print("v4: "); Serial.println(v4);
 
+  if (v1 > MAX_SPEED)
+    v1 = MAX_SPEED;
+  if (v1 < MIN_SPEED)
+    v1 = MIN_SPEED;
+
+  if (v2 > MAX_SPEED)
+    v2 = MAX_SPEED;
+  if (v2 < MIN_SPEED)
+    v2 = MIN_SPEED;
+  
   if (v3 > MAX_SPEED)
     v3 = MAX_SPEED;
   if (v3 < MIN_SPEED)
@@ -81,8 +96,8 @@ void writeToMotors()
 
   motor3.write(v3);
   motor4.write(v4);
-  motor2.write(v3);
-  motor1.write(v4);
+  motor2.write(v2);
+  motor1.write(v1);
 }
 
 void setup() {
@@ -154,13 +169,14 @@ void loop() {
   //    rollRads = roll * 0.017444; // convert to rads
   //    roll = abs(roll) * sin(rollRads);
 
-  Serial.print(" P: "); Serial.println(pitch);
-  Serial.print(" R: "); Serial.println(roll);
+  Serial.print("P: "); Serial.println(pitch);
+  Serial.print("R: "); Serial.println(roll);
 
   calculateVelocities();
   writeToMotors();
 
-  Serial.println(micros() - startTime);
-  Serial.println(throttle);
+  Serial.print("Time: "); Serial.println(micros() - startTime);
+  Serial.print(" Throttle: "); Serial.println(throttle);
+  Serial.println();
 }
 
